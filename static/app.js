@@ -255,6 +255,8 @@ function renderResult(record) {
   sum.innerHTML = r.summary;
   $("btnExport").disabled = false;
   $("btnCopy").disabled = false;
+  // 误差校核只针对已保存方案: 未保存(草稿)时禁用
+  $("btnWeighing").disabled = !(record.id !== null && record.id !== undefined);
 
   drawRotor(r);
   renderPairs(r);
@@ -472,6 +474,7 @@ async function renderHistory() {
       </div>
       <div class="rowline">
         <button class="iconbtn" data-a="load">载入</button>
+        <button class="iconbtn" data-a="weigh">误差校核</button>
         <button class="iconbtn" data-a="export">导出</button>
         <button class="iconbtn" data-a="del">删除</button>
       </div>`;
@@ -488,6 +491,7 @@ async function renderHistory() {
       syncCompareButton();
     };
     d.querySelector('[data-a="load"]').onclick = () => loadPlan(it.id);
+    d.querySelector('[data-a="weigh"]').onclick = () => openWeighingDialog(it.id);
     d.querySelector('[data-a="export"]').onclick = () => { window.location = `/api/plan/${it.id}/export`; };
     d.querySelector('[data-a="del"]').onclick = async () => {
       if (!confirm(`删除方案 #${it.id}?`)) return;
@@ -640,6 +644,192 @@ async function loadPlan(id) {
   $("historyDialog").classList.remove("open");
   toast(`已载入方案 #${id}。`);
 }
+
+// ---------------------------------------------------------------------------
+// 称重误差校核(只读, 基于已保存方案)
+// ---------------------------------------------------------------------------
+const wcState = { planId: null, plan: null, rows: [] };
+
+async function openWeighingDialog(id) {
+  $("btnWeighing").blur();
+  try {
+    const resp = await fetch(`/api/plan/${id}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "方案读取失败");
+    wcState.planId = id;
+    wcState.plan = data;
+    wcState.rows = data.result.placements
+      .filter((p) => p.slot !== null && p.slot !== undefined)
+      .map((p) => ({
+        tube_id: p.tube_id, slot: p.slot, angle: p.angle,
+        mass: p.mass, err: 0,
+      }))
+      .sort((a, b) => (a.slot - b.slot) || (a.tube_id - b.tube_id));
+    $("weighingMeta").innerHTML =
+      `方案 <b>#${data.id} ${data.name}</b> · ${new Date(data.created_at).toLocaleString()} ·
+       R=${data.request.radius_mm}mm ·
+       ${data.result.config.rpm} rpm · ${wcState.rows.length} 支已放置试管 ·
+       标称 |U₁|=${fmt(data.result.metrics.u1_mag_g_mm)} g·mm`;
+    $("wcLimit").value = "";
+    $("wcUniform").value = "";
+    $("wcResult").innerHTML = "";
+    renderWcTubes();
+    $("weighingDialog").classList.add("open");
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function renderWcTubes() {
+  const tb = $("wcTubeBody");
+  tb.innerHTML = "";
+  wcState.rows.forEach((r) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${r.tube_id}</td>
+      <td>${r.slot} <span class="small">(${fmt(r.angle, 1)}°)</span></td>
+      <td>${r.mass}</td>
+      <td><input type="number" min="0" max="${r.mass}" step="any" value="${r.err}"
+           data-tid="${r.tube_id}" style="width:110px"></td>
+      <td class="small" data-range="${r.tube_id}">${fmt(r.mass - r.err, 3)} ~ ${fmt(r.mass + r.err, 3)}</td>`;
+    tr.querySelector("input").oninput = (e) => {
+      let v = parseFloat(e.target.value);
+      if (isNaN(v) || v < 0) v = 0;
+      if (v > r.mass) { v = r.mass; e.target.value = v; }
+      r.err = v;
+      tr.querySelector(`[data-range="${r.tube_id}"]`).textContent =
+        `${fmt(r.mass - v, 3)} ~ ${fmt(r.mass + v, 3)}`;
+    };
+    tb.appendChild(tr);
+  });
+}
+
+$("btnWcApplyUniform").onclick = () => {
+  const v = parseFloat($("wcUniform").value);
+  if (isNaN(v) || v < 0) { toast("请输入非负的统一误差上界。", true); return; }
+  let clamped = false;
+  wcState.rows.forEach((r) => {
+    if (v > r.mass) { r.err = r.mass; clamped = true; }
+    else r.err = v;
+  });
+  renderWcTubes();
+  if (clamped) toast("部分试管误差上界已截断到其标称质量。");
+};
+
+$("btnWcRun").onclick = async () => {
+  const btn = $("btnWcRun");
+  btn.disabled = true;
+  try {
+    const limitRaw = $("wcLimit").value;
+    const body = {
+      tube_errors: wcState.rows
+        .filter((r) => r.err > 0)
+        .map((r) => ({ tube_id: r.tube_id, mass_error_bound_g: r.err })),
+    };
+    if (limitRaw !== "") {
+      const lim = parseFloat(limitRaw);
+      if (isNaN(lim) || lim < 0) { toast("限值必须为非负数, 或留空。", true); return; }
+      body.u1_limit_g_mm = lim;
+    }
+    const resp = await fetch(`/api/plan/${wcState.planId}/weighing-check`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "校核失败");
+    renderWcResult(data);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+function renderWcResult(d) {
+  const box = $("wcResult");
+  const n = d.nominal, w = d.worst_case;
+  let verdict;
+  if (d.within_limit === true) {
+    verdict = `<div class="wc-ok">✔ <b>合格</b>: 最不利 |U₁|=${fmt(w.u1_mag_g_mm)} g·mm
+      ≤ 限值 ${fmt(d.u1_limit_g_mm)} g·mm, 余量 ${fmt(d.margin_g_mm)} g·mm。
+      即使各管称重误差同时取到最不利方向, 一阶不平衡量仍不超限。</div>`;
+  } else if (d.within_limit === false) {
+    const pct = d.u1_limit_g_mm > 0
+      ? ` (约 ${((w.u1_mag_g_mm / d.u1_limit_g_mm - 1) * 100).toFixed(1)}%)`
+      : "";
+    verdict = `<div class="wc-bad">✘ <b>超限</b>: 最不利 |U₁|=${fmt(w.u1_mag_g_mm)} g·mm
+      &gt; 限值 ${fmt(d.u1_limit_g_mm)} g·mm, 超出 ${fmt(d.excess_g_mm)} g·mm${pct}。
+      按称重误差区间判定不合格, 需提高称量精度或重新配平。</div>`;
+  } else {
+    verdict = `<div class="wc-note">未填写限值, 仅给出最不利 |U₁|=${fmt(w.u1_mag_g_mm)}
+      g·mm, 不做合格判定。</div>`;
+  }
+
+  const naiveRow = d.naive_equals_exact
+    ? `<span class="small">本例各误差贡献在最不利方向上同向, 朴素标量估计恰好等于精确值。</span>`
+    : `<span class="wc-hi">朴素标量估计 ${fmt(d.naive_abs_worst_g_mm)} g·mm 严格高估</span>
+       <span class="small">(|U₁标称| ${fmt(n.u1_mag_g_mm)} + R·Σe ${fmt(d.abs_dev_bound_g_mm)}),
+       误差是<b>向量叠加</b>, 不能把各管误差绝对值直接相加。</span>`;
+
+  const rows = d.tubes.map((t) => {
+    const signTxt = t.delta_g > 1e-12
+      ? `<span class="wc-pos">+${fmt(t.delta_g, 3)}</span>`
+      : t.delta_g < -1e-12
+        ? `<span class="wc-neg">${fmt(t.delta_g, 3)}</span>`
+        : "0";
+    return `<tr>
+      <td>${t.tube_id}</td>
+      <td>${t.slot} <span class="small">(${fmt(t.angle_deg, 1)}°)</span></td>
+      <td>${fmt(t.nominal_mass_g, 3)}</td>
+      <td>±${fmt(t.mass_error_bound_g, 3)}</td>
+      <td>${signTxt}</td>
+      <td><b>${fmt(t.actual_mass_g, 3)}</b></td>
+      <td>${fmt(t.u1_along_worst_g_mm, 1)}</td>
+    </tr>`;
+  }).join("");
+
+  box.innerHTML = `
+    ${verdict}
+    <table class="cmp-table">
+      <thead><tr><th>指标</th><th style="text-align:right">标称值</th>
+        <th style="text-align:right">最不利值</th><th style="text-align:right">增量</th></tr></thead>
+      <tbody>
+        <tr><td>一阶不平衡量 |U₁| (g·mm)</td>
+          <td style="text-align:right">${fmt(n.u1_mag_g_mm)}</td>
+          <td style="text-align:right" class="wc-hi">${fmt(w.u1_mag_g_mm)}</td>
+          <td style="text-align:right">+${fmt(d.worst_minus_nominal_g_mm)}</td></tr>
+        <tr><td>U₁ 方向 (°)</td>
+          <td style="text-align:right">${fmt(n.u1_angle_deg, 1)}</td>
+          <td style="text-align:right">${fmt(w.u1_angle_deg, 1)}</td>
+          <td style="text-align:right" class="small">可能偏转</td></tr>
+        <tr><td>对应离心合力 F (N, ${d.rpm} rpm)</td>
+          <td style="text-align:right">${fmt(n.centrifugal_force_n, 3)}</td>
+          <td style="text-align:right">${fmt(w.centrifugal_force_n, 3)}</td>
+          <td style="text-align:right">+${fmt(w.centrifugal_force_n - n.centrifugal_force_n, 3)}</td></tr>
+      </tbody>
+    </table>
+    <div class="rowline" style="margin:7px 0;gap:10px;flex-wrap:wrap">
+      ${naiveRow}
+    </div>
+    <h2 style="font-size:13px;margin:10px 0 6px">达到最不利 |U₁| 的一组实际质量
+      <span class="small">(各管误差独立取 +e/-e; 末列为该管误差沿最不利 U₁ 方向的投影 g·mm)</span></h2>
+    <table class="cmp-table wc-table">
+      <thead><tr><th>试管</th><th>槽位/角度</th><th>标称(g)</th><th>误差上界</th>
+        <th>误差取值 δ</th><th>实际质量(g)</th><th>沿 U₁ 投影</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="small" style="margin-top:6px">算法: ${d.method}; 枚举凸多边形顶点数 ≤ ${d.vertex_count}。
+      本次校核为只读结果, 方案 #${d.plan.id} 未被修改。</div>`;
+}
+
+$("btnWeighing").onclick = () => {
+  if (state.record && state.record.id !== null && state.record.id !== undefined) {
+    openWeighingDialog(state.record.id);
+  } else {
+    toast("请先从历史方案载入一条已保存方案, 或先计算并保存方案。", true);
+  }
+};
+$("btnCloseWeighing").onclick = () => $("weighingDialog").classList.remove("open");
 
 // ---------------------------------------------------------------------------
 // 标签页 & 初始化

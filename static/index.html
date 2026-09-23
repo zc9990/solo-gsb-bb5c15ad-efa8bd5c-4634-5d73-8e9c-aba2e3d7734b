@@ -103,6 +103,16 @@ th{color:var(--mut);font-weight:500}
   padding:9px 12px;font-size:12.5px;line-height:1.5;margin:8px 0}
 .cmp-ok{background:#10331f;border:1px solid var(--acc2);color:#bbf7d0;border-radius:8px;
   padding:9px 12px;font-size:12.5px;margin:8px 0}
+.wc-ok{background:#10331f;border:1px solid var(--acc2);color:#bbf7d0;border-radius:9px;
+  padding:11px 14px;font-size:13.5px;line-height:1.6;margin:10px 0}
+.wc-bad{background:#3d1414;border:1px solid var(--bad);color:#fecaca;border-radius:9px;
+  padding:11px 14px;font-size:13.5px;line-height:1.6;margin:10px 0}
+.wc-note{background:var(--panel2);border:1px dashed var(--line);border-radius:8px;
+  padding:8px 11px;font-size:12px;color:var(--mut);line-height:1.55;margin:8px 0}
+.wc-table td:nth-child(n+4){text-align:right}
+.wc-hi{color:var(--warn);font-weight:600}
+.wc-pos{color:var(--bad)} .wc-neg{color:var(--acc2)}
+.dialog .box.wider{width:min(860px,95vw)}
 .cmp-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .cmp-col h3{font-size:13px;margin:0 0 6px;color:var(--acc)}
 .cmp-col h3.b{color:var(--acc2)}
@@ -192,6 +202,7 @@ th{color:var(--mut);font-weight:500}
       <h2 style="margin:0">配平结果</h2>
       <span class="small" id="solveInfo"></span>
       <div class="spacer" style="flex:1"></div>
+      <button id="btnWeighing" disabled title="对已保存方案做称重误差校核(只读)">称重误差校核</button>
       <button id="btnExport" disabled>导出 JSON</button>
       <button id="btnCopy" disabled>复制 JSON</button>
     </div>
@@ -268,6 +279,44 @@ th{color:var(--mut);font-weight:500}
     <div class="rowline"><h2 style="margin:0">方案比较</h2><div style="flex:1"></div>
       <button id="btnCloseCompare" class="ghost">关闭</button></div>
     <div id="compareBody" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<div id="weighingDialog" class="dialog">
+  <div class="box wider">
+    <div class="rowline"><h2 style="margin:0">称重误差校核</h2><div style="flex:1"></div>
+      <button id="btnCloseWeighing" class="ghost">关闭</button></div>
+    <div class="wc-note">固定读取该方案的落槽与角度, 不可修改; 逐管填写非负称重质量误差上界
+      (0 ≤ e<sub>k</sub> ≤ 标称质量), 实际质量按 m<sub>k</sub> ± e<sub>k</sub> 独立正负变化。
+      校核为<b>只读</b>, 结果不保存、不覆盖原方案。服务端在误差区间内精确求最不利 |U₁|
+      (二维 zonotope 顶点枚举, 非 2<sup>n</sup> 组合枚举), 并同时给出标称 |U₁| 作对照。</div>
+    <div id="weighingMeta" class="small" style="margin:4px 0 8px"></div>
+    <div class="rowline" style="gap:10px;flex-wrap:wrap;margin-bottom:8px">
+      <div style="flex:1;min-width:200px">
+        <label>一阶不平衡量限值 |U₁| (g·mm), 留空则只计算不判定</label>
+        <input id="wcLimit" type="number" min="0" step="any" placeholder="例如 1000">
+      </div>
+      <div style="flex:1;min-width:200px">
+        <label>批量统一误差上界 (g)</label>
+        <div class="rowline">
+          <input id="wcUniform" type="number" min="0" step="any" placeholder="对全部试管填入相同 e">
+          <button id="btnWcApplyUniform" class="iconbtn">填入全部</button>
+        </div>
+      </div>
+    </div>
+    <div style="max-height:280px;overflow:auto">
+      <table class="wc-table">
+        <thead><tr><th>试管</th><th>槽位 / 角度</th><th>标称质量(g)</th>
+          <th style="width:130px">误差上界 e(g)</th>
+          <th>允许质量区间(g)</th></tr></thead>
+        <tbody id="wcTubeBody"></tbody>
+      </table>
+    </div>
+    <div class="rowline" style="margin-top:10px">
+      <button id="btnWcRun" class="primary">执行误差校核</button>
+      <span class="small">只读操作, 不会修改或覆盖历史方案。</span>
+    </div>
+    <div id="wcResult" style="margin-top:6px"></div>
   </div>
 </div>
 

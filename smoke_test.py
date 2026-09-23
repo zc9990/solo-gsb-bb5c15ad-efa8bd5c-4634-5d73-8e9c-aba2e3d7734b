@@ -304,6 +304,86 @@ except main.HTTPException as e:
     assert e.status_code == 404
 print("compare validation OK")
 
+# ---- 称重误差校核(只读) ----
+import math as _math
+def wc_route(plan_id):
+    found = find("POST", f"/api/plan/{plan_id}/weighing-check")
+    return (found if isinstance(found, tuple) else (found, ()))
+def wc_call(plan_id, errors, limit=None):
+    fn, args = wc_route(plan_id)
+    req = types.SimpleNamespace(
+        tube_errors=[types.SimpleNamespace(tube_id=int(t),
+                                          mass_error_bound_g=float(e))
+                     for t, e in errors],
+        u1_limit_g_mm=limit,
+    )
+    return fn(*args, req)
+
+nom_u1 = rec["result"]["metrics"]["u1_mag_g_mm"]
+masses = {p["tube_id"]: p["mass"] for p in rec["result"]["placements"]}
+errs = [(tid, min(0.5, m)) for tid, m in masses.items()]
+wc = wc_call(1, errs)
+# 标称值必须与原方案指标一致(固定落槽/角度)
+assert abs(wc["nominal"]["u1_mag_g_mm"] - nom_u1) < 1e-6, wc["nominal"]
+# 最不利值不小于标称值; 实际质量落在 [m-e, m+e] 且向量复算与最不利值一致
+assert wc["worst_case"]["u1_mag_g_mm"] + 1e-7 >= nom_u1
+ux = uy = 0.0
+for row in wc["tubes"]:
+    m, e = masses[row["tube_id"]], row["mass_error_bound_g"]
+    assert m - e - 1e-9 <= row["actual_mass_g"] <= m + e + 1e-9
+    a = _math.radians(row["angle_deg"])
+    ux += row["actual_mass_g"] * _math.cos(a)
+    uy += row["actual_mass_g"] * _math.sin(a)
+recomputed = 100.0 * _math.hypot(ux, uy)
+assert abs(recomputed - wc["worst_case"]["u1_mag_g_mm"]) < 1e-5, (
+    recomputed, wc["worst_case"]["u1_mag_g_mm"])
+# 用 2^n 全组合枚举交叉验证最不利值
+placed = [p for p in rec["result"]["placements"]]
+emap = dict(errs)
+brute = 0.0
+for mask in range(1 << len(placed)):
+    bx = by = 0.0
+    for i, p in enumerate(placed):
+        s = 1.0 if (mask >> i) & 1 else -1.0
+        mm = p["mass"] + s * emap[p["tube_id"]]
+        a = _math.radians(p["angle"])
+        bx += mm * _math.cos(a); by += mm * _math.sin(a)
+    brute = max(brute, 100.0 * _math.hypot(bx, by))
+assert abs(brute - wc["worst_case"]["u1_mag_g_mm"]) < 1e-5, (brute, wc["worst_case"])
+# 限值判定: 取最不利值+1 合格 / -1 超限 / 0 限值必超限(标称非零)
+wc_ok = wc_call(1, errs, wc["worst_case"]["u1_mag_g_mm"] + 1.0)
+assert wc_ok["within_limit"] is True and wc_ok["excess_g_mm"] == 0.0
+wc_bad = wc_call(1, errs, max(0.0, wc["worst_case"]["u1_mag_g_mm"] - 1.0))
+assert wc_bad["within_limit"] is False
+assert abs(wc_bad["excess_g_mm"] - 1.0) < 1e-6
+wc_nolim = wc_call(1, errs)
+assert wc_nolim["within_limit"] is None and wc_nolim["excess_g_mm"] is None
+# 缺省(全部误差为 0): 最不利 == 标称
+wc_zero = wc_call(1, [])
+assert abs(wc_zero["worst_case"]["u1_mag_g_mm"] - nom_u1) < 1e-7
+print("weighing-check worst=%.3f nominal=%.3f brute=%.3f naive=%.3f OK" % (
+    wc["worst_case"]["u1_mag_g_mm"], nom_u1, brute, wc["naive_abs_worst_g_mm"]))
+
+# 校验错误: 误差超标称质量 / 试管不存在 / 重复填写 -> 400
+tid0, m0 = next(iter(masses.items()))
+for bad_body in (
+    [(tid0, m0 + 0.01)],        # 超过标称质量
+    [(99999, 0.1)],             # 方案中不存在的试管
+    [(tid0, 0.1), (tid0, 0.2)],# 重复填写
+):
+    try:
+        wc_call(1, bad_body); raise SystemExit("should 400")
+    except main.HTTPException as e:
+        assert e.status_code == 400, e
+# 方案不存在 -> 404
+try:
+    wc_call(999, [(1, 0.1)]); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code == 404
+# 只读: 校核后原方案指标不变
+assert call("GET", "/api/plan/1")["result"]["metrics"]["u1_mag_g_mm"] == nom_u1
+print("weighing-check validation/read-only OK")
+
 # 列表 / 详情 / 导出 / 删除
 lst=call("GET","/api/plans")
 assert len(lst["items"])==3

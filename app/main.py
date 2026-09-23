@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import time
@@ -16,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from .balancer import run_plan
 from .compare import compare_plans
+from .weighing import worst_case_u1
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -74,6 +76,19 @@ class TubeIn(BaseModel):
 class PreviousPlacement(BaseModel):
     tube_id: int
     slot: int
+
+
+class TubeErrorIn(BaseModel):
+    tube_id: int
+    # 非负称重质量误差上界(g); 不得超过该管标称质量, 由校核逻辑按方案校验
+    mass_error_bound_g: float = Field(ge=0)
+
+
+class WeighingCheckRequest(BaseModel):
+    # 逐管非负质量误差上界; 未列出的试管按 0(标称质量无误差)处理
+    tube_errors: list[TubeErrorIn] = Field(default_factory=list)
+    # 一阶不平衡量限值(g·mm), 以最不利 |U₁| 判定
+    u1_limit_g_mm: Optional[float] = Field(default=None, ge=0)
 
 
 class PlanRequest(BaseModel):
@@ -286,6 +301,65 @@ def export_plan(plan_id: int) -> JSONResponse:
         plan,
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
+
+
+@app.post("/api/plan/{plan_id}/weighing-check")
+def weighing_check(plan_id: int, req: WeighingCheckRequest) -> dict[str, Any]:
+    """对已保存方案做称重误差校核(只读): 固定落槽与角度取自方案, 不覆盖原方案。
+
+    各管实际质量在 [m-e, m+e] 内可独立正负变化, 服务端用二维 zonotope 顶点
+    枚举精确求最不利 |U₁| 及一组对应实际质量(不枚举 2^n 组合, 也不把误差
+    绝对值标量相加), 同时返回标称 |U₁| 作对照。
+    """
+    row = _load_plan_row(plan_id)
+    plan = _row_to_plan(row)
+    result = plan["result"]
+    placements = result.get("placements", [])
+    placed_ids = {
+        int(p["tube_id"]) for p in placements if p.get("slot") is not None
+    }
+
+    errors: dict[int, float] = {}
+    for item in req.tube_errors:
+        if item.tube_id in errors:
+            raise HTTPException(
+                status_code=400,
+                detail=f"试管 {item.tube_id} 的误差上界重复填写。",
+            )
+        if item.tube_id not in placed_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"试管 {item.tube_id} 不在方案 {plan_id} 的摆放明细中。",
+            )
+        errors[item.tube_id] = item.mass_error_bound_g
+
+    radius_mm = float(result["config"]["radius_mm"])
+    try:
+        check = worst_case_u1(
+            placements=placements,
+            radius_mm=radius_mm,
+            errors=errors,
+            u1_limit_g_mm=req.u1_limit_g_mm,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    rpm = float(result["config"]["rpm"])
+    omega = 2.0 * math.pi * rpm / 60.0
+    check["rpm"] = rpm
+    check["angular_velocity_rad_s"] = omega
+    check["nominal"]["centrifugal_force_n"] = (
+        omega ** 2 * check["nominal"]["u1_mag_g_mm"] * 1e-6
+    )
+    check["worst_case"]["centrifugal_force_n"] = (
+        omega ** 2 * check["worst_case"]["u1_mag_g_mm"] * 1e-6
+    )
+    check["plan"] = {
+        "id": plan["id"],
+        "name": plan["name"],
+        "created_at": plan["created_at"],
+    }
+    return check
 
 
 # ---------------------------------------------------------------------------
