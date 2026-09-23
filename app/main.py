@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from .balancer import run_plan
 from .compare import compare_plans
+from .errorcheck import check_plan, error_form_context
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -74,6 +75,18 @@ class TubeIn(BaseModel):
 class PreviousPlacement(BaseModel):
     tube_id: int
     slot: int
+
+
+class TubeErrorBound(BaseModel):
+    tube_id: int
+    error_bound_g: float = Field(ge=0)
+
+
+class ErrorCheckRequest(BaseModel):
+    # 逐管非负质量误差上界(g); 缺省试管按 0 处理。服务端校验不超过标称质量。
+    error_bounds: list[TubeErrorBound] = Field(default_factory=list)
+    # 一阶不平衡量限值 (g·mm); 可空 = 仅计算不判定
+    limit_g_mm: Optional[float] = Field(default=None, ge=0)
 
 
 class PlanRequest(BaseModel):
@@ -267,6 +280,30 @@ def compare_saved_plans(a: int, b: int) -> dict[str, Any]:
     plan_a = _row_to_plan(_load_plan_row(a))
     plan_b = _row_to_plan(_load_plan_row(b))
     return compare_plans(plan_a, plan_b)
+
+
+@app.get("/api/plan/{plan_id}/error-check/form")
+def error_check_form(plan_id: int) -> dict[str, Any]:
+    """称重误差校核表单的只读上下文: 固定落槽/角度、标称质量与标称 |U₁|。"""
+    return error_form_context(_row_to_plan(_load_plan_row(plan_id)))
+
+
+@app.post("/api/plan/{plan_id}/error-check")
+def error_check(plan_id: int, req: ErrorCheckRequest) -> dict[str, Any]:
+    """对已保存方案做称重误差校核(只读, 不写库、不覆盖原方案)。
+
+    在各管误差于 ±误差上界内独立变化的区间上, 精确求最不利一阶不平衡量
+    及对应的一组实际质量, 并按给定限值判定。
+    """
+    plan = _row_to_plan(_load_plan_row(plan_id))
+    try:
+        return check_plan(
+            plan,
+            [b.model_dump() for b in req.error_bounds],
+            req.limit_g_mm,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.delete("/api/plan/{plan_id}")

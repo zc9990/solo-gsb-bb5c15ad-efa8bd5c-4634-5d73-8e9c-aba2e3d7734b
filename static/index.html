@@ -116,7 +116,23 @@ th{color:var(--mut);font-weight:500}
 .st-moved{color:var(--warn);border-color:var(--warn)}
 .st-unchanged{color:var(--mut)}
 .diff-group-title{font-size:12.5px;color:var(--warn);margin:10px 0 2px;font-weight:600}
-@media(max-width:1080px){.wrap{grid-template-columns:1fr}.result{grid-template-columns:1fr}.cmp-grid{grid-template-columns:1fr}}
+/* 称重误差校核 */
+.ec-warn{background:#10331f;border:1px solid var(--acc2);color:#bbf7d0;border-radius:8px;
+  padding:9px 12px;font-size:12.5px;margin:8px 0;line-height:1.55}
+.ec-bad{background:#3a1414;border:1px solid var(--bad);color:#fecaca;border-radius:8px;
+  padding:9px 12px;font-size:12.5px;margin:8px 0;line-height:1.55}
+.ec-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin:8px 0}
+.ec-col h3{font-size:12.5px;margin:0 0 6px}
+.ec-col.nom h3{color:var(--mut)}
+.ec-col.worst h3{color:var(--bad)}
+.ec-col.naive h3{color:var(--warn)}
+.ec-col .metric{background:var(--panel2)}
+.ec-sig{font-size:11px;font-weight:700;border-radius:4px;padding:0 5px;margin-left:4px}
+.ec-sig.pos{color:var(--bad);background:#3a1414}
+.ec-sig.neg{color:var(--acc2);background:#10331f}
+.ec-formtip{font-size:12px;color:var(--mut);line-height:1.55;margin:6px 0}
+#errCheckBody table input[type=number]{padding:4px 6px;width:100%}
+@media(max-width:1080px){.wrap{grid-template-columns:1fr}.result{grid-template-columns:1fr}.cmp-grid{grid-template-columns:1fr}.ec-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -194,6 +210,7 @@ th{color:var(--mut);font-weight:500}
       <div class="spacer" style="flex:1"></div>
       <button id="btnExport" disabled>导出 JSON</button>
       <button id="btnCopy" disabled>复制 JSON</button>
+      <button id="btnErrCurrent" disabled>称重误差校核</button>
     </div>
     <div class="result">
       <div>
@@ -268,6 +285,14 @@ th{color:var(--mut);font-weight:500}
     <div class="rowline"><h2 style="margin:0">方案比较</h2><div style="flex:1"></div>
       <button id="btnCloseCompare" class="ghost">关闭</button></div>
     <div id="compareBody" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<div id="errCheckDialog" class="dialog">
+  <div class="box wide">
+    <div class="rowline"><h2 style="margin:0">称重误差校核</h2><div style="flex:1"></div>
+      <button id="btnCloseErr" class="ghost">关闭</button></div>
+    <div id="errCheckBody" style="margin-top:8px"></div>
   </div>
 </div>
 

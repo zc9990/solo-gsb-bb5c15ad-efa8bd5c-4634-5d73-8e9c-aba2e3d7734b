@@ -255,6 +255,7 @@ function renderResult(record) {
   sum.innerHTML = r.summary;
   $("btnExport").disabled = false;
   $("btnCopy").disabled = false;
+  $("btnErrCurrent").disabled = false;
 
   drawRotor(r);
   renderPairs(r);
@@ -488,6 +489,7 @@ async function renderHistory() {
       syncCompareButton();
     };
     d.querySelector('[data-a="load"]').onclick = () => loadPlan(it.id);
+    d.querySelector('[data-a="errcheck"]').onclick = () => openErrorCheck(it.id);
     d.querySelector('[data-a="export"]').onclick = () => { window.location = `/api/plan/${it.id}/export`; };
     d.querySelector('[data-a="del"]').onclick = async () => {
       if (!confirm(`删除方案 #${it.id}?`)) return;
@@ -638,8 +640,176 @@ async function loadPlan(id) {
   renderSlotEditor(); renderTubes();
   renderResult({ id: data.id, name: data.name, request: q, result: data.result });
   $("historyDialog").classList.remove("open");
+  $("btnErrCurrent").disabled = false;
   toast(`已载入方案 #${id}。`);
 }
+
+// ---------------------------------------------------------------------------
+// 称重误差校核(只读, 不覆盖原方案)
+// ---------------------------------------------------------------------------
+const ecState = { planId: null, ctx: null };
+
+function ecMetricCard(k, v, unit) {
+  return `<div class="metric"><div class="k">${k}</div><div class="v">${v} <span class="u">${unit}</span></div></div>`;
+}
+
+async function openErrorCheck(planId) {
+  try {
+    const resp = await fetch(`/api/plan/${planId}/error-check/form`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "无法打开校核表单");
+    ecState.planId = planId;
+    ecState.ctx = data;
+    renderErrorForm(data);
+    $("errCheckDialog").classList.add("open");
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function renderErrorForm(ctx) {
+  const rows = ctx.tubes.map((t) => `
+    <tr>
+      <td>${t.tube_id}</td>
+      <td>${t.slot}</td>
+      <td>${fmt(t.angle_deg, 1)}°</td>
+      <td>${t.nominal_mass_g} g</td>
+      <td style="width:150px"><input type="number" min="0" step="any"
+        max="${t.nominal_mass_g}" value="0" data-tid="${t.tube_id}"
+        data-mass="${t.nominal_mass_g}" placeholder="0"></td>
+    </tr>`).join("");
+  const nomTxt = ctx.nominal_u1_mag_g_mm === null || ctx.nominal_u1_mag_g_mm === undefined
+    ? "–" : `${fmt(ctx.nominal_u1_mag_g_mm)} g·mm`;
+  $("errCheckBody").innerHTML = `
+    <div class="cmp-ok">只读校核: 固定落槽与角度取自方案 <b>#${ctx.plan_id} ${ctx.plan_name}</b>,
+      不会修改或覆盖原方案。各管称重误差在 <b>±误差上界</b> 内<b>独立</b>正负变化,
+      服务端精确求解最不利 |U₁|(zonotope 顶点扫掠, 不枚举 2ⁿ 组合), 而非把误差绝对值直接相加。</div>
+    <div class="small">R = ${ctx.radius_mm} mm · ${ctx.rpm} rpm ·
+      标称 |U₁| = ${nomTxt}${ctx.nominal_grade ? ` · 评级 ${ctx.nominal_grade}` : ""}</div>
+    <div class="rowline" style="margin:10px 0;gap:10px">
+      <div style="width:260px"><label>一阶不平衡量限值 (g·mm, 可空)</label>
+        <input id="ecLimit" type="number" min="0" step="any" placeholder="仅计算不判定"></div>
+      <div style="flex:1"></div>
+      <button id="btnEcRun" class="primary">执行校核</button>
+    </div>
+    <div class="ec-formtip">逐管填写非负质量误差上界(g), 不得超过该管标称质量; 留空或 0 表示该管质量无误差。</div>
+    <table class="cmp-table">
+      <thead><tr><th>试管</th><th>固定槽</th><th>角度</th><th>标称质量</th><th>质量误差上界 ±(g)</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div id="ecResult"></div>`;
+  $("btnEcRun").onclick = runErrorCheck;
+}
+
+async function runErrorCheck() {
+  const bounds = [];
+  const inputs = $("errCheckBody").querySelectorAll('input[data-tid]');
+  for (const inp of inputs) {
+    const raw = inp.value.trim();
+    if (raw === "") continue;
+    const v = parseFloat(raw);
+    const mass = parseFloat(inp.dataset.mass);
+    if (!(v >= 0)) { toast(`试管 ${inp.dataset.tid} 的误差上界必须为非负数。`, true); return; }
+    if (v > mass + 1e-9) {
+      toast(`试管 ${inp.dataset.tid} 的误差上界不能超过标称质量 ${mass} g。`, true);
+      return;
+    }
+    bounds.push({ tube_id: parseInt(inp.dataset.tid), error_bound_g: v });
+  }
+  const limRaw = $("ecLimit").value.trim();
+  let limit = null;
+  if (limRaw !== "") {
+    limit = parseFloat(limRaw);
+    if (!(limit >= 0)) { toast("限值必须为非负数。", true); return; }
+  }
+  const btn = $("btnEcRun");
+  btn.disabled = true; btn.textContent = "校核中…";
+  try {
+    const resp = await fetch(`/api/plan/${ecState.planId}/error-check`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ error_bounds: bounds, limit_g_mm: limit }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "校核失败");
+    renderErrorResult(data);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false; btn.textContent = "执行校核";
+  }
+}
+
+function renderErrorResult(r) {
+  const nom = r.nominal, wc = r.worst_case;
+  let banner;
+  if (r.verdict) {
+    const v = r.verdict;
+    if (v.worst_case_pass) {
+      banner = `<div class="ec-warn">✔ 即使在最不利称重误差组合下,
+        |U₁| = <b>${fmt(wc.u1_mag_g_mm)} g·mm</b> 仍 ≤ 限值 ${fmt(v.limit_g_mm)} g·mm,
+        余量 ${fmt(v.margin_g_mm)} g·mm。校核通过。
+        (标称 ${fmt(nom.u1_mag_g_mm)} g·mm, ${v.nominal_pass ? "标称合格" : "标称已超限"})</div>`;
+    } else {
+      banner = `<div class="ec-bad">✘ 最不利 |U₁| = <b>${fmt(wc.u1_mag_g_mm)} g·mm</b>
+        超过限值 ${fmt(v.limit_g_mm)} g·mm, 超出量 ${fmt(-v.margin_g_mm)} g·mm, 校核不通过。
+        标称 |U₁| = ${fmt(nom.u1_mag_g_mm)} g·mm(${v.nominal_pass ? "标称合格但误差可致超限" : "标称已超限"})。</div>`;
+    }
+  } else {
+    banner = `<div class="ec-formtip">未设限值, 仅给出最不利结果。最不利 |U₁| 相对标称增大
+      ${fmt(r.increment_g_mm)} g·mm${r.magnification ? `(×${r.magnification.toFixed(3)})` : ""}。</div>`;
+  }
+
+  const cols = `
+    <div class="ec-col nom"><h3>标称(误差为 0)</h3>
+      ${ecMetricCard("|U₁|", fmt(nom.u1_mag_g_mm), "g·mm")}
+      ${ecMetricCard("方向", fmt(nom.u1_angle_deg, 1), "°")}
+      ${ecMetricCard("离心合力 F", fmt(nom.centrifugal_force_n, 3), "N")}
+    </div>
+    <div class="ec-col worst"><h3>最不利实际(精确求解)</h3>
+      ${ecMetricCard("|U₁| max", fmt(wc.u1_mag_g_mm), "g·mm")}
+      ${ecMetricCard("方向", fmt(wc.u1_angle_deg, 1), "°")}
+      ${ecMetricCard("离心合力 F", fmt(wc.centrifugal_force_n, 3), "N")}
+    </div>
+    <div class="ec-col naive"><h3>标量相加粗略上界(对照)</h3>
+      ${ecMetricCard("标称|U₁|+ΣR·ε", fmt(r.naive_scalar_bound_g_mm), "g·mm")}
+      ${ecMetricCard("ΣR·ε(误差项)", fmt(r.error_scalar_sum_g_mm), "g·mm")}
+      ${ecMetricCard("对应 F", fmt(r.naive_scalar_force_n, 3), "N")}
+    </div>`;
+
+  const rows = r.tubes.map((t) => {
+    const sig = t.error_sign > 0
+      ? '<span class="ec-sig pos">+ε</span>'
+      : (t.error_bound_g > 0 ? '<span class="ec-sig neg">−ε</span>' : "");
+    return `<tr>
+      <td>${t.tube_id}</td>
+      <td>${t.slot}</td>
+      <td>${fmt(t.angle_deg, 1)}°</td>
+      <td>${t.nominal_mass_g}</td>
+      <td>±${t.error_bound_g}</td>
+      <td><b>${fmt(t.actual_mass_g, 3)}</b> g ${sig}</td>
+      <td>${t.mass_delta_g >= 0 ? "+" : ""}${fmt(t.mass_delta_g, 3)} g</td>
+    </tr>`;
+  }).join("");
+
+  $("ecResult").innerHTML = `
+    ${banner}
+    <div class="ec-grid">${cols}</div>
+    <div class="small" style="margin:4px 0 8px">精确最不利值 ≤ 标量相加粗略上界;
+      后者把各管误差向量视为全部同向, 通常过保守。最不利方向角 = ${fmt(wc.u1_angle_deg, 1)}°。</div>
+    <h2 style="font-size:13px;margin:10px 0 6px">一组达到最不利值的实际质量</h2>
+    <table class="cmp-table">
+      <thead><tr><th>试管</th><th>槽位</th><th>角度</th><th>标称质量(g)</th>
+        <th>误差上界</th><th>实际质量</th><th>实际偏差</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="small" style="margin-top:6px">${r.method}</div>`;
+}
+
+$("btnCloseErr").onclick = () => $("errCheckDialog").classList.remove("open");
+$("btnErrCurrent").onclick = () => {
+  if (state.record?.id != null) openErrorCheck(state.record.id);
+  else toast("请先计算并保存方案。", true);
+};
 
 // ---------------------------------------------------------------------------
 // 标签页 & 初始化

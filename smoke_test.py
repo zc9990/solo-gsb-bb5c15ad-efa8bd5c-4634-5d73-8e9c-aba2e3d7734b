@@ -173,6 +173,20 @@ def find(method, path):
             return fn, tuple(args)
     return None
 
+def _build_error_check(body):
+    def b(d):
+        o = types.SimpleNamespace(tube_id=int(d["tube_id"]),
+                                  error_bound_g=float(d["error_bound_g"]))
+        o.model_dump = lambda d=d: {"tube_id": int(d["tube_id"]),
+                                    "error_bound_g": float(d["error_bound_g"])}
+        return o
+    merged = {"error_bounds": [], "limit_g_mm": None, **body}
+    return types.SimpleNamespace(
+        error_bounds=[b(d) for d in merged["error_bounds"]],
+        limit_g_mm=(None if merged["limit_g_mm"] is None
+                    else float(merged["limit_g_mm"])),
+    )
+
 def call(method, path, body=None):
     raw_query = path.split("?", 1)[1] if "?" in path else ""
     r = find(method,path)
@@ -185,9 +199,11 @@ def call(method, path, body=None):
             qargs[k] = int(v) if v.lstrip("-").isdigit() else v
         args = tuple(qargs.get(p) for p in fn.__code__.co_varnames[:fn.__code__.co_argcount])
     if body is not None:
-        model_cls = main.PlanRequest
-        req = _build_concrete(model_cls, body)
-        return fn(req)
+        if path.endswith("/error-check"):
+            req = _build_error_check(body)
+        else:
+            req = _build_concrete(main.PlanRequest, body)
+        return fn(*args, req) if args else fn(req)
     return fn(*args)
 
 def _build_concrete(cls, data):
@@ -303,6 +319,74 @@ try:
 except main.HTTPException as e:
     assert e.status_code == 404
 print("compare validation OK")
+
+# 称重误差校核(plan#1 只读)
+ec_form = call("GET", "/api/plan/1/error-check/form")
+assert ec_form["plan_id"] == 1
+assert len(ec_form["tubes"]) == 6, len(ec_form["tubes"])
+# 固定落槽/角度与方案一致, 表单只读
+pl1 = {p["tube_id"]: p for p in rec["result"]["placements"]}
+for t in ec_form["tubes"]:
+    assert t["slot"] == pl1[t["tube_id"]]["slot"]
+    assert abs(t["angle_deg"] - pl1[t["tube_id"]]["angle"]) < 1e-9
+    assert t["nominal_mass_g"] == pl1[t["tube_id"]]["mass"]
+print("error-check form OK, tubes=%d" % len(ec_form["tubes"]))
+
+ec_body = {
+    "error_bounds": [
+        {"tube_id": p["tube_id"], "error_bound_g": 0.5}
+        for p in rec["result"]["placements"]
+    ],
+    "limit_g_mm": 5000.0,
+}
+ec = call("POST", "/api/plan/1/error-check", ec_body)
+# 标称值与原方案指标一致
+assert abs(ec["nominal"]["u1_mag_g_mm"] - m["u1_mag_g_mm"]) < 1e-6
+# 最不利 >= 标称, 且 <= 标量相加粗略上界
+assert ec["worst_case"]["u1_mag_g_mm"] + 1e-9 >= ec["nominal"]["u1_mag_g_mm"]
+assert ec["naive_scalar_bound_g_mm"] + 1e-9 >= ec["worst_case"]["u1_mag_g_mm"]
+# 回报一组实际质量, 质量非负、偏差不越界
+for row in ec["tubes"]:
+    assert row["actual_mass_g"] >= -1e-9
+    assert abs(row["mass_delta_g"]) <= row["error_bound_g"] + 1e-9
+# 用回报的实际质量独立暴力复核最不利 |U1|(不依赖被测算法): 枚举 2^6 符号
+import itertools
+pt = [(p["tube_id"], p["mass"], p["angle"]) for p in rec["result"]["placements"]]
+bf_best = -1.0
+for combo in itertools.product([-1, 1], repeat=len(pt)):
+    vx = vy = 0.0
+    for (tid, mass, ang), sgn in zip(pt, combo):
+        mm = mass + sgn * 0.5
+        rad = __import__("math").radians(ang)
+        vx += mm * __import__("math").cos(rad)
+        vy += mm * __import__("math").sin(rad)
+    bf_best = max(bf_best, 100.0 * __import__("math").hypot(vx, vy))
+assert abs(bf_best - ec["worst_case"]["u1_mag_g_mm"]) < 1e-6, \
+    (bf_best, ec["worst_case"]["u1_mag_g_mm"])
+assert ec["verdict"]["limit_g_mm"] == 5000.0
+assert ec["verdict"]["worst_case_pass"] == (ec["worst_case"]["u1_mag_g_mm"] <= 5000.0)
+print("error-check worst U1=%.2f nominal=%.2f naive=%.2f brute=%.2f pass=%s" % (
+    ec["worst_case"]["u1_mag_g_mm"], ec["nominal"]["u1_mag_g_mm"],
+    ec["naive_scalar_bound_g_mm"], bf_best, ec["verdict"]["worst_case_pass"]))
+
+# 校核只读: 方案数量不变、原方案标称指标未被覆盖
+lst_ec = call("GET", "/api/plans")
+assert len(lst_ec["items"]) == 3
+assert abs(call("GET", "/api/plan/1")["result"]["metrics"]["u1_mag_g_mm"]
+           - m["u1_mag_g_mm"]) < 1e-9
+
+# 越界误差上界(>标称质量) -> 400
+bad_ec = {"error_bounds": [{"tube_id": 5, "error_bound_g": 999.0}]}
+try:
+    call("POST", "/api/plan/1/error-check", bad_ec); raise SystemExit("should 400")
+except main.HTTPException as e:
+    assert e.status_code == 400, e.status_code
+# 不存在方案 -> 404
+try:
+    call("GET", "/api/plan/999/error-check/form"); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code == 404
+print("error-check validation/read-only OK")
 
 # 列表 / 详情 / 导出 / 删除
 lst=call("GET","/api/plans")
